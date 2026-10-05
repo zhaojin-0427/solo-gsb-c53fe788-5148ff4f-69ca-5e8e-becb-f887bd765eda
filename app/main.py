@@ -16,6 +16,7 @@ from . import regions as regions_mod
 from . import releases
 from .release_api import router as release_router
 from .config import (
+    ACCEPTANCE_DIR,
     DB_PATH,
     JOB_DIR,
     MAX_DIMENSION,
@@ -25,6 +26,7 @@ from .config import (
 )
 from .profiles import ProfileError
 from . import retouch as rt
+from . import acceptance as ac
 
 
 @asynccontextmanager
@@ -475,6 +477,169 @@ def get_retouch_artifact(retouch_id: str, name: str):
             filename=f"retouched-{retouch_id[:12]}.tif",
         )
     raise HTTPException(404, "产物不存在")
+
+
+# ---------------------------------------------------------------------------
+# API: 印后测色验收（已保存任务 / 达标修色成品 + 实测 CSV，逐点 ΔE00）
+# ---------------------------------------------------------------------------
+
+def _acceptance_dir(acceptance_id: str) -> Path:
+    d = ACCEPTANCE_DIR / acceptance_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_job_for_acceptance(job_id: str):
+    """载入验收所需的原任务数据：meta、原分色 cmyk、逐像素 lab_press。"""
+    job_base = JOB_DIR / job_id
+    if not (job_base / "meta.json").exists():
+        raise HTTPException(404, "任务不存在或已被删除")
+    try:
+        meta = json.loads((job_base / "meta.json").read_text("utf-8"))
+        cmyk = np.load(job_base / "cmyk.npy", mmap_mode="r")
+        lab_press = np.load(job_base / "lab_press.npy", mmap_mode="r")
+    except FileNotFoundError:
+        raise HTTPException(422, "原任务分色/预测数据（cmyk.npy、lab_press.npy）缺失，拒绝验收")
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(422, f"原任务元数据不可读: {exc}")
+    return job_base, meta, np.asarray(cmyk, dtype=np.uint8), np.asarray(lab_press, dtype=np.float64)
+
+
+def _resolve_press_for_acceptance(meta: dict):
+    """取原任务印刷 ICC 当前字节并严格核验摘要；缺失/不符一律 422。"""
+    state = app.state.state
+    recorded = ac._recorded_press_digest(app.state.db, meta["job_id"], meta)
+    try:
+        press_bytes = state.pm.load_bytes(meta["press_profile"])
+    except ProfileError as exc:
+        raise HTTPException(422, f"原任务印刷 ICC 缺失，无法验收: {exc}")
+    try:
+        ac.verify_job_press_icc(meta, press_bytes, recorded)
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+    return press_bytes, pl.summary_from_bytes(press_bytes, meta["press_profile"])
+
+
+@app.get("/api/jobs/{job_id}/retouches")
+def list_job_retouches(job_id: str):
+    """列出该任务可作为印后验收依据的达标修色成品。"""
+    _require_job(job_id)
+    return ac.list_retouches_for_job(RETOUCH_DIR, job_id)
+
+
+@app.post("/api/acceptance")
+async def create_acceptance(
+    job_id: str = Form(...),
+    limit_de: float = Form(...),
+    file: UploadFile = File(...),
+    retouch_id: str | None = Form(None),
+):
+    raw = await file.read()
+    try:
+        parsed = ac.parse_measurements_csv(raw)
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, f"测点 CSV 非法：{exc}")
+    if isinstance(retouch_id, str) and retouch_id.strip() == "":
+        retouch_id = None
+    try:
+        req = ac.validate_request(parsed, job_id, retouch_id, limit_de)
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+
+    _job_base, meta, cmyk_full, lab_press = _load_job_for_acceptance(job_id)
+    press_bytes, press_summary = _resolve_press_for_acceptance(meta)
+
+    retouch_report = None
+    if req.retouch_id:
+        try:
+            retouch_report = ac.verify_retouch_binding(
+                req.retouch_id, RETOUCH_DIR, cmyk_full, meta, press_bytes
+            )
+        except ac.AcceptanceNotFound as exc:
+            raise HTTPException(404, str(exc))
+        except ac.AcceptanceError as exc:
+            raise HTTPException(422, str(exc))
+
+    acceptance_id = ac.compute_acceptance_id(req)
+    base = _acceptance_dir(acceptance_id)
+
+    try:
+        result = ac.evaluate(req, meta, cmyk_full, lab_press,
+                             press_bytes, retouch_report)
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+
+    report = ac.build_report(acceptance_id, req, meta, press_summary,
+                             retouch_report, result)
+
+    # 标注底图固定取原任务软打样 PNG（嵌入显示 ICC）；标注图与报告均为
+    # 确定性产物（无时间戳），相同请求重复提交逐字节一致。
+    softproof_png = (JOB_DIR / job_id / "softproof.png").read_bytes()
+    try:
+        annotated = ac.render_annotated_png(softproof_png, result, retouch_report)
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+
+    (base / "measurements.csv").write_text(req.csv_canonical, "utf-8")
+    (base / "annotated.png").write_bytes(annotated)
+    (base / "report.json").write_text(
+        json.dumps(report, sort_keys=True, ensure_ascii=False, indent=2),
+        "utf-8",
+    )
+
+    return {
+        "acceptance_id": acceptance_id,
+        "passed": report["passed"],
+        "job_id": job_id,
+        "retouch_id": req.retouch_id,
+        "limit_de00": report["limit_de00"],
+        "point_count": report["point_count"],
+        "over_count": report["over_count"],
+        "max_de00": report["max_de00"],
+        "mean_de00": report["mean_de00"],
+        "over_coordinates": report["over_coordinates"],
+        "points": report["points"],
+        "report_url": f"/api/acceptance/{acceptance_id}/report",
+        "annotated_url": f"/api/acceptance/{acceptance_id}/annotated.png",
+        "report": report,
+    }
+
+
+def _require_acceptance(acceptance_id: str) -> Path:
+    base = ACCEPTANCE_DIR / acceptance_id
+    if not (base / "report.json").exists():
+        raise HTTPException(404, "验收记录不存在")
+    return base
+
+
+@app.get("/api/acceptance/{acceptance_id}/report")
+def get_acceptance_report(acceptance_id: str):
+    base = _require_acceptance(acceptance_id)
+    return FileResponse(
+        base / "report.json", media_type="application/json",
+        filename=f"acceptance-{acceptance_id[:12]}.json",
+    )
+
+
+@app.get("/api/acceptance/{acceptance_id}/annotated.png")
+def get_acceptance_annotated(acceptance_id: str):
+    base = _require_acceptance(acceptance_id)
+    png = base / "annotated.png"
+    if not png.is_file():
+        raise HTTPException(404, "验收标注图不存在")
+    return FileResponse(png, media_type="image/png")
+
+
+@app.get("/api/acceptance/{acceptance_id}/measurements.csv")
+def get_acceptance_csv(acceptance_id: str):
+    base = _require_acceptance(acceptance_id)
+    csv_path = base / "measurements.csv"
+    if not csv_path.is_file():
+        raise HTTPException(404, "验收测点 CSV 不存在")
+    return FileResponse(
+        csv_path, media_type="text/csv",
+        filename=f"measurements-{acceptance_id[:12]}.csv",
+    )
 
 
 # Static frontend (mounted last so /api routes win).

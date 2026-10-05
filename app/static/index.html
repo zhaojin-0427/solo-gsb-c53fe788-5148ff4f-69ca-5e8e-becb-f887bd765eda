@@ -14,6 +14,7 @@
   <nav class="topnav">
     <button class="navbtn active" data-view="softproof">软打样</button>
     <button class="navbtn" data-view="retouch">局部 CMYK 修色</button>
+    <button class="navbtn" data-view="acceptance">印后测色验收</button>
     <button class="navbtn" data-view="release">印刷配置版本发布与回归门禁</button>
   </nav>
 </header>
@@ -204,7 +205,70 @@
   </section>
 </main>
 
-<!-- ================= 视图三：发布与回归门禁（新增） ================= -->
+<!-- ================= 视图三：印后测色验收（新增） ================= -->
+<main id="view-acceptance" class="view" hidden>
+  <section class="panel controls">
+    <h2>1. 选择已保存任务</h2>
+    <div class="row">
+      <select id="acJobSelect"></select>
+      <button type="button" id="acRefreshJobs" class="btn">刷新任务列表</button>
+    </div>
+    <div id="acJobMeta" class="hint"></div>
+
+    <h2>2. 可选：绑定达标修色成品</h2>
+    <div class="row">
+      <select id="acRetouchSelect">
+        <option value="">不绑定修色（按原任务分色预测验收）</option>
+      </select>
+    </div>
+    <div id="acRetouchMeta" class="hint"></div>
+
+    <h2>3. 上传实测测点 CSV</h2>
+    <div class="row">
+      <input type="file" id="acCsvFile" accept=".csv,text/csv">
+    </div>
+    <div class="hint">
+      CSV 必须非空、UTF-8；首行表头恰好为 <code>x,y,L,a,b</code>；
+      x/y 为零基非负整数且不得超出图像，L ∈ 0–100、a/b ∈ -128–127 的有限数值；
+      至少一条测点，同坐标复测逐条保留。
+    </div>
+
+    <h2>4. ΔE00 上限</h2>
+    <div class="row">
+      <label>任一测点允许的最大 ΔE00（≥ 0）
+        <input type="number" id="acLimit" min="0" step="0.1" value="3.0">
+      </label>
+    </div>
+
+    <div class="row">
+      <button type="button" id="acRunBtn" class="primary">执行印后验收</button>
+      <span id="acBusy" class="hint" hidden>回算与比对中…</span>
+    </div>
+    <div id="acError" class="error" hidden></div>
+  </section>
+
+  <section class="panel" id="acResultPanel" hidden>
+    <h2>验收结果</h2>
+    <div id="acStatus" class="rt-status"></div>
+    <div class="stats" id="acStats"></div>
+    <div class="canvas-wrap">
+      <img id="acAnnotated" alt="超限测点标注图（红=超限，绿=合格，橙框=修色选区）">
+    </div>
+    <div class="hint">红色十字/圆圈为 ΔE00 超限测点，绿色圆圈为合格测点；橙色矩形为绑定的修色选区（选区外保持原任务预测）。</div>
+    <div id="acOverList" class="region"></div>
+    <div class="exports">
+      <a id="acExpReport" class="btn primary" download>下载验收报告 JSON</a>
+      <a id="acExpAnnotated" class="btn" download>下载超限标注图 PNG</a>
+      <a id="acExpCsv" class="btn" download>下载规范化测点 CSV</a>
+    </div>
+    <details class="reportbox">
+      <summary>查看验收报告</summary>
+      <pre id="acReportJson"></pre>
+    </details>
+  </section>
+</main>
+
+<!-- ================= 视图四：发布与回归门禁 ================= -->
 <main id="view-release" class="view" hidden>
   <section class="panel" id="relLeft">
     <div class="rel-head">
@@ -243,6 +307,7 @@
 
 <script src="/app.js"></script>
 <script src="/retouch.js"></script>
+<script src="/acceptance.js"></script>
 <script src="/release.js"></script>
 </body>
 </html>
