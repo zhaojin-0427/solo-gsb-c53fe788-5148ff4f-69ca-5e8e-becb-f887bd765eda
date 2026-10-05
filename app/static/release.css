@@ -160,3 +160,44 @@ label.inline { flex-direction: row; align-items: center; gap: 6px; }
 }
 .rt-proofs figcaption { font-size: 12px; color: #555; margin-bottom: 4px; }
 #rtCanvasWrap { min-height: 240px; }
+
+/* 印后测色验收视图 */
+#view-acceptance {
+  grid-template-columns: 420px 1fr;
+}
+#acMarkCanvas { position: absolute; top: 0; left: 0; margin: 0; pointer-events: none; }
+#acCanvasWrap { min-height: 240px; }
+.ac-legend {
+  display: inline-block;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  vertical-align: middle;
+  margin: 0 4px;
+}
+.ac-legend.ac-over { background: rgba(255,0,0,.3); border: 2px solid #ff1a1a; }
+.ac-over-chip {
+  display: inline-block;
+  background: #fdecec;
+  border: 1px solid #e0a4a4;
+  color: #a02525;
+  border-radius: 12px;
+  padding: 2px 10px;
+  margin: 3px 4px 3px 0;
+  font-size: 12.5px;
+}
+.ac-table-wrap { max-height: 420px; overflow: auto; padding: 0; }
+table.ac-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+table.ac-table th, table.ac-table td {
+  border: 1px solid #e2e5ea;
+  padding: 4px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+table.ac-table th { background: #f0f3f8; position: sticky; top: 0; }
+tr.ac-row-over td { background: #fdecec; }
+.ac-bad { color: #a02525; }
+.ac-src { color: #555; font-size: 12px; }

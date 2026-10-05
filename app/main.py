@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
 from . import database as db
 from . import pipeline as pl
@@ -16,6 +18,7 @@ from . import regions as regions_mod
 from . import releases
 from .release_api import router as release_router
 from .config import (
+    ACCEPTANCE_DIR,
     DB_PATH,
     JOB_DIR,
     MAX_DIMENSION,
@@ -24,6 +27,7 @@ from .config import (
     init_state,
 )
 from .profiles import ProfileError
+from . import acceptance as ac
 from . import retouch as rt
 
 
@@ -41,7 +45,7 @@ async def lifespan(app: FastAPI):
     conn.close()
 
 
-app = FastAPI(title="印前色彩软打样台", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="印前色彩软打样台", version="1.3.0", lifespan=lifespan)
 app.include_router(release_router)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -475,6 +479,201 @@ def get_retouch_artifact(retouch_id: str, name: str):
             filename=f"retouched-{retouch_id[:12]}.tif",
         )
     raise HTTPException(404, "产物不存在")
+
+
+# ---------------------------------------------------------------------------
+# API: 印后测色验收（post-press color acceptance）
+# ---------------------------------------------------------------------------
+
+def _acceptance_dir(acceptance_id: str) -> Path:
+    d = ACCEPTANCE_DIR / acceptance_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _is_sha256_id(value: str) -> bool:
+    return bool(value) and len(value) == 64 and all(
+        c in "0123456789abcdef" for c in value
+    )
+
+
+@app.get("/api/jobs/{job_id}/retouches")
+def list_job_retouches(job_id: str):
+    """列出该已保存任务下可用于印后验收的**达标**修色成品。"""
+    _require_job(job_id)
+    return ac.list_retouches_for_job(RETOUCH_DIR, job_id)
+
+
+@app.post("/api/acceptance")
+async def create_acceptance(
+    job_id: str = Form(...),
+    limit_de: float = Form(...),
+    file: UploadFile = File(...),
+    retouch_id: str | None = Form(None),
+):
+    if not isinstance(limit_de, (int, float)) or isinstance(limit_de, bool):
+        raise HTTPException(422, "ΔE00 上限必须是非负数值")
+    limit_de = float(limit_de)
+    if not np.isfinite(limit_de) or limit_de < 0.0:
+        raise HTTPException(422, "ΔE00 上限必须是非负有限数值")
+
+    csv_bytes = await file.read()
+
+    job_base = JOB_DIR / job_id
+    if not (job_base / "meta.json").exists():
+        raise HTTPException(404, "任务不存在或已被删除")
+
+    rid = (retouch_id or "").strip() or None
+    if rid == "":
+        rid = None
+    if rid is not None and not _is_sha256_id(rid):
+        raise HTTPException(422, "retouch_id 必须是 64 位十六进制内容哈希")
+    retouch_base = RETOUCH_DIR / rid if rid is not None else None
+    if rid is not None and not (retouch_base / "report.json").exists():
+        raise HTTPException(404, "所选修色任务不存在或已被删除")
+
+    try:
+        ctx = ac.load_job(job_base)
+    except ac.AcceptanceNotFound as exc:
+        raise HTTPException(404, str(exc))
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+    meta = ctx["meta"]
+
+    # 严格按任务尺寸校验 CSV（越界一律拒绝）。
+    try:
+        points = ac.parse_measurements(
+            csv_bytes, int(meta["width"]), int(meta["height"])
+        )
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+
+    # 原任务印刷 ICC：必须存在且摘要与任务固化记录严格一致。
+    state = app.state.state
+    row = db.get_job(app.state.db, job_id)
+    digest = ac.recorded_press_digest(row, meta)
+    try:
+        press_bytes = state.pm.load_bytes(meta["press_profile"])
+        ac.verify_press(press_bytes, digest)
+        press_summary_full = pl.summary_from_bytes(
+            press_bytes, meta["press_profile"]
+        )
+    except ProfileError as exc:
+        raise HTTPException(422, f"原任务印刷 ICC 缺失，无法验收: {exc}")
+    except ac.AcceptanceError as exc:
+        raise HTTPException(422, str(exc))
+
+    # 可选修色成品：独立内容绑定核验；不可达/绑定不符一律拒绝，不回退。
+    retouch_report = None
+    verified_tiff = None
+    if rid is not None:
+        try:
+            retouch_report = ac.verify_retouch_binding(
+                rid, retouch_base, ctx, ctx["cmyk"], press_bytes
+            )
+            with Image.open(retouch_base / "retouched.tif") as im:
+                im.load()
+                verified_tiff = np.asarray(im)
+        except ac.AcceptanceNotFound as exc:
+            raise HTTPException(404, str(exc))
+        except ac.AcceptanceError as exc:
+            raise HTTPException(422, str(exc))
+        except Exception as exc:  # 成品无法解码等同绑定不符，拒绝验收。
+            raise HTTPException(422, f"修色成品无法核验: {exc}")
+
+    csv_sha = hashlib.sha256(csv_bytes).hexdigest()
+    fingerprint = ac.request_fingerprint(
+        meta, points, limit_de, rid, digest
+    )
+    acceptance_id = ac.compute_acceptance_id(fingerprint)
+    base = _acceptance_dir(acceptance_id)
+    report_path = base / "report.json"
+
+    report = None
+    if report_path.exists():
+        try:
+            cached = json.loads(report_path.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cached = None
+        if cached is not None and ac.verify_report_binding(
+            cached, acceptance_id, fingerprint, ctx, points, limit_de,
+            press_bytes, press_summary_full, rid, retouch_report,
+            verified_tiff, csv_sha,
+        ):
+            report = cached
+        elif cached is not None:
+            # 内容寻址目录出现绑定不符的脏文件：拒绝验收而不是静默覆盖。
+            raise HTTPException(
+                422, "已存在的验收报告与当前任务/ICC/修色绑定核验不符，拒绝验收"
+            )
+
+    if report is None:
+        evaluation = ac.evaluate(
+            points, limit_de, ctx, press_bytes, press_summary_full,
+            rid, retouch_report, verified_tiff,
+        )
+        report = ac.build_report(
+            acceptance_id, fingerprint, ctx, points, limit_de,
+            rid, retouch_report, evaluation, csv_sha,
+        )
+        (base / "measurements.csv").write_bytes(csv_bytes)
+        report_path.write_text(
+            json.dumps(report, sort_keys=True, ensure_ascii=False, indent=2),
+            "utf-8",
+        )
+
+    return {
+        "acceptance_id": acceptance_id,
+        "passed": report["passed"],
+        "job_id": job_id,
+        "retouch_id": rid,
+        "point_count": report["point_count"],
+        "over_limit_count": report["over_limit_count"],
+        "over_limit_points": report["over_limit_points"],
+        "limit_de00": report["rule"]["limit_de00"],
+        "stats": report["stats"],
+        "prediction_method": report["prediction_method"],
+        "points": report["points"],
+        "report_url": f"/api/acceptance/{acceptance_id}/report",
+        "softproof_url": f"/api/jobs/{job_id}/images/softproof.png",
+        "report": report,
+    }
+
+
+def _require_acceptance(acceptance_id: str) -> Path:
+    if not _is_sha256_id(acceptance_id):
+        raise HTTPException(404, "验收报告不存在")
+    base = ACCEPTANCE_DIR / acceptance_id
+    if not (base / "report.json").exists():
+        raise HTTPException(404, "验收报告不存在")
+    return base
+
+
+@app.get("/api/acceptance/{acceptance_id}")
+def get_acceptance(acceptance_id: str):
+    base = _require_acceptance(acceptance_id)
+    return JSONResponse(json.loads((base / "report.json").read_text("utf-8")))
+
+
+@app.get("/api/acceptance/{acceptance_id}/report")
+def get_acceptance_report(acceptance_id: str):
+    base = _require_acceptance(acceptance_id)
+    return FileResponse(
+        base / "report.json", media_type="application/json",
+        filename=f"acceptance-{acceptance_id[:12]}.json",
+    )
+
+
+@app.get("/api/acceptance/{acceptance_id}/measurements.csv")
+def get_acceptance_csv(acceptance_id: str):
+    base = _require_acceptance(acceptance_id)
+    csv_path = base / "measurements.csv"
+    if not csv_path.exists():
+        raise HTTPException(404, "验收测点 CSV 不存在")
+    return FileResponse(
+        csv_path, media_type="text/csv",
+        filename=f"measurements-{acceptance_id[:12]}.csv",
+    )
 
 
 # Static frontend (mounted last so /api routes win).

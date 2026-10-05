@@ -14,10 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 持久化目录（ICC 配置、任务产物、局部修色产物、SQLite、发布/门禁不可变存储）
+# 持久化目录（ICC 配置、任务产物、局部修色产物、SQLite、发布/门禁不可变存储、印后验收产物）
 RUN mkdir -p /data/profiles/source /data/profiles/press \
     /data/profiles/display /data/profiles/builtin /data/jobs \
-    /data/retouch \
+    /data/retouch /data/acceptance \
     /data/release/snapshots /data/release/baselines /data/release/gates
 ENV SPD_DATA_DIR=/data \
     SPD_MAX_DIMENSION=3000 \
